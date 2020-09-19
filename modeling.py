@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from global_configs import *
 
+
 class MAG(nn.Module):
     def __init__(self, hidden_size, beta_shift, dropout_prob):
         super(MAG, self).__init__()
@@ -12,11 +13,11 @@ class MAG(nn.Module):
             )
         )
 
-        self.W_hv = nn.Linear(VISUAL_DIM + TEXT_DIM, TEXT_DIM)
-        self.W_ha = nn.Linear(ACOUSTIC_DIM + TEXT_DIM, TEXT_DIM)
+        self.W_hv = nn.Linear(VISUAL_DIM + hidden_size, hidden_size)
+        self.W_ha = nn.Linear(ACOUSTIC_DIM + hidden_size, hidden_size)
 
-        self.W_v = nn.Linear(VISUAL_DIM, TEXT_DIM)
-        self.W_a = nn.Linear(ACOUSTIC_DIM, TEXT_DIM)
+        self.W_v = nn.Linear(VISUAL_DIM, hidden_size)
+        self.W_a = nn.Linear(ACOUSTIC_DIM, hidden_size)
         self.beta_shift = beta_shift
 
         self.LayerNorm = nn.LayerNorm(hidden_size)
@@ -24,8 +25,11 @@ class MAG(nn.Module):
 
     def forward(self, text_embedding, visual, acoustic):
         eps = 1e-6
-        weight_v = F.relu(self.W_hv(torch.cat((visual, text_embedding), dim=-1)))
-        weight_a = F.relu(self.W_ha(torch.cat((acoustic, text_embedding), dim=-1)))
+
+        weight_v = F.relu(
+            self.W_hv(torch.cat((visual, text_embedding), dim=-1)))
+        weight_a = F.relu(
+            self.W_ha(torch.cat((acoustic, text_embedding), dim=-1)))
 
         h_m = weight_v * self.W_v(visual) + weight_a * self.W_a(acoustic)
 

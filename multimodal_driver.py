@@ -12,7 +12,7 @@ from typing import *
 from sklearn.metrics import classification_report
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import precision_recall_fscore_support
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
 import wandb
 import torch
@@ -21,30 +21,32 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Tenso
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
-from torch.nn import CrossEntropyLoss, L1Loss, MSELoss
+from torch.nn import CrossEntropyLoss, L1Loss, MSELoss, BCEWithLogitsLoss
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import matthews_corrcoef
-from transformers import BertTokenizer, XLNetTokenizer, get_linear_schedule_with_warmup
+from transformers import AlbertTokenizer, BertTokenizer, XLNetTokenizer, get_linear_schedule_with_warmup
 from transformers.optimization import AdamW
 from bert import MAG_BertForSequenceClassification
 from xlnet import MAG_XLNetForSequenceClassification
+from albert import MAG_AlbertForSequenceClassification
 
 from argparse_utils import str2bool, seed
-from global_configs import ACOUSTIC_DIM, VISUAL_DIM, DEVICE
+from global_configs import ACOUSTIC_DIM, VISUAL_DIM, DEVICE, DATASET_LOCATION
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--dataset", type=str, choices=["mosi", "mosei"], default="mosi")
+parser.add_argument("--dataset", type=str,
+                    choices=["humor", "sarcasm"], default="humor")
 parser.add_argument("--max_seq_length", type=int, default=50)
 parser.add_argument("--train_batch_size", type=int, default=48)
 parser.add_argument("--dev_batch_size", type=int, default=128)
 parser.add_argument("--test_batch_size", type=int, default=128)
-parser.add_argument("--n_epochs", type=int, default=40)
+parser.add_argument("--n_epochs", type=int, default=10)
 parser.add_argument("--beta_shift", type=float, default=1.0)
 parser.add_argument("--dropout_prob", type=float, default=0.5)
 parser.add_argument(
     "--model",
     type=str,
-    choices=["bert-base-uncased", "xlnet-base-cased"],
+    choices=["bert-base-uncased", "xlnet-base-cased", "albert-base-v2"],
     default="bert-base-uncased",
 )
 parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -104,52 +106,90 @@ def get_inversion(tokens: List[str], SPIECE_MARKER="▁"):
     return inversions
 
 
-def convert_to_features(examples, max_seq_length, tokenizer):
-    with open(os.path.join("datasets", args.dataset, "word2id.pickle"), "rb") as handle:
-        word_to_id = pickle.load(handle)
-    id_to_word = {id_: word for (word, id_) in word_to_id.items()}
+def _truncate_seq_pair(tokens_a, tokens_b, max_length):
+    """Truncates a sequence pair in place to the maximum length."""
+    while True:
+        total_length = len(tokens_a) + len(tokens_b)
+        if total_length <= max_length:
+            break
+        if len(tokens_a) == 0:
+            tokens_b.pop()
+        else:
+            tokens_a.pop(0)
 
+
+def convert_to_features(examples, max_seq_length, tokenizer):
     features = []
 
     for (ex_index, example) in enumerate(examples):
 
-        (word_ids, visual, acoustic), label_id, segment = example
-        sentence = " ".join([id_to_word[id] for id in word_ids])
+        (
+            (p_words, p_visual, p_acoustic, p_w_idx, p_concept_idx, p_vad, p_eigen),
+            (c_words, c_visual, c_acoustic, c_w_idx, c_concept_idx, c_vad, c_eigen),
+            hid,
+            label,
+        ) = example
 
-        tokens = tokenizer.tokenize(sentence)
-        inversions = get_inversion(tokens)
+        # add full stops
+        c_words = ". ".join(c_words)
+        p_words = p_words + "."
 
-        new_visual = []
-        new_audio = []
+        tokens_a = tokenizer.tokenize(c_words)
+        tokens_b = tokenizer.tokenize(p_words)
 
-        for inv_id in inversions:
-            new_visual.append(visual[inv_id, :])
-            new_audio.append(acoustic[inv_id, :])
+        inversions_a = get_inversion(tokens_a)
+        inversions_b = get_inversion(tokens_b)
 
-        visual = np.array(new_visual)
-        acoustic = np.array(new_audio)
+        _truncate_seq_pair(tokens_a, tokens_b, max_seq_length - 3)
 
-        # Truncate input if necessary
-        if len(tokens) > max_seq_length - 2:
-            tokens = tokens[: max_seq_length - 2]
-            acoustic = acoustic[: max_seq_length - 2]
-            visual = visual[: max_seq_length - 2]
-
-        if args.model == "bert-base-uncased":
-            prepare_input = prepare_bert_input
+        if args.model == "bert-base-uncased" or args.model == 'albert-base-v2':
+            prepare_text = preapre_bert_text_input
         elif args.model == "xlnet-base-cased":
-            prepare_input = prepare_xlnet_input
+            prepare_text = prepare_xlnet_text_input
 
-        input_ids, visual, acoustic, input_mask, segment_ids = prepare_input(
-            tokens, visual, acoustic, tokenizer
-        )
+        input_ids, input_mask, segment_ids = prepare_text(
+            tokens_a, tokens_b, tokenizer, max_seq_length)
 
-        # Check input length
-        assert len(input_ids) == args.max_seq_length
-        assert len(input_mask) == args.max_seq_length
-        assert len(segment_ids) == args.max_seq_length
-        assert acoustic.shape[0] == args.max_seq_length
-        assert visual.shape[0] == args.max_seq_length
+        inversions_a = inversions_a[-len(tokens_a):]
+        inversions_b = inversions_b[:len(tokens_b)]
+
+        visual_a = []
+        acoustic_a = []
+        for inv_id in inversions_a:
+            visual_a.append(c_visual[inv_id, :])
+            acoustic_a.append(c_acoustic[inv_id, :])
+
+        visual_a = np.array(visual_a)
+        acoustic_a = np.array(acoustic_a)
+
+        visual_b = []
+        acoustic_b = []
+        for inv_id in inversions_b:
+            visual_b.append(p_visual[inv_id, :])
+            acoustic_b.append(p_acoustic[inv_id, :])
+
+        visual_b = np.array(visual_b)
+        acoustic_b = np.array(acoustic_b)
+
+        if(len(tokens_a) > 0):
+            visual = np.concatenate((visual_a, visual_b))
+            acoustic = np.concatenate((acoustic_a, acoustic_b))
+        else:
+            visual = visual_b
+            acoustic = acoustic_b
+
+        visual = pad_multimodal_input(
+            visual, input_ids, tokenizer, max_seq_length)
+        acoustic = pad_multimodal_input(
+            acoustic, input_ids, tokenizer, max_seq_length)
+
+        assert len(input_ids) == max_seq_length
+        assert len(input_mask) == max_seq_length
+        assert len(segment_ids) == max_seq_length
+        assert acoustic.shape == (max_seq_length, ACOUSTIC_DIM)
+        assert visual.shape == (max_seq_length, VISUAL_DIM)
+
+        label_id = float(label)
 
         features.append(
             InputFeatures(
@@ -164,63 +204,68 @@ def convert_to_features(examples, max_seq_length, tokenizer):
     return features
 
 
-def prepare_bert_input(tokens, visual, acoustic, tokenizer):
-    # Append [CLS] [SEP] tokens
-    tokens = ["[CLS]"] + tokens + ["[SEP]"]
+def preapre_bert_text_input(tokens_a, tokens_b, tokenizer, max_seq_length):
+    CLS = tokenizer.cls_token
+    SEP = tokenizer.sep_token
+    PAD_ID = tokenizer.pad_token_id
 
-    # Pad zero vectors for acoustic / visual vectors to account for [CLS] / [SEP] tokens
-    acoustic_zero = np.zeros((1, ACOUSTIC_DIM))
-    acoustic = np.concatenate((acoustic_zero, acoustic, acoustic_zero))
-    visual_zero = np.zeros((1, VISUAL_DIM))
-    visual = np.concatenate((visual_zero, visual, visual_zero))
-
-    input_ids = tokenizer.convert_tokens_to_ids(tokens)
-    segment_ids = [0] * len(input_ids)
+    input_tokens = [CLS] + tokens_a + [SEP] + tokens_b + [SEP]
+    input_ids = tokenizer.convert_tokens_to_ids(input_tokens)
     input_mask = [1] * len(input_ids)
+    segment_ids = [0] * (len(tokens_a) + 2) + [1] * (len(tokens_b) + 1)
 
-    # Pad acoustic / visual vectors up to maximum sequence
-    acoustic_padding = np.zeros((args.max_seq_length - len(input_ids), ACOUSTIC_DIM))
-    acoustic = np.concatenate((acoustic, acoustic_padding))
+    padding_len = (max_seq_length - len(input_ids))
+    input_ids += [PAD_ID] * padding_len
+    input_mask += [0] * padding_len
+    segment_ids += [0] * padding_len
 
-    visual_padding = np.zeros((args.max_seq_length - len(input_ids), VISUAL_DIM))
-    visual = np.concatenate((visual, visual_padding))
-
-    padding = [0] * (args.max_seq_length - len(input_ids))
-
-    # Pad inputs
-    input_ids += padding
-    input_mask += padding
-    segment_ids += padding
-
-    return input_ids, visual, acoustic, input_mask, segment_ids
+    return input_ids, input_mask, segment_ids
 
 
-def prepare_xlnet_input(tokens, visual, acoustic, tokenizer):
-    tokens = tokens + ["[SEP]"] + ["[CLS]"]
-    audio_zero = np.zeros((1, ACOUSTIC_DIM))
-    acoustic = np.concatenate((acoustic, audio_zero, audio_zero))
-    visual_zero = np.zeros((1, VISUAL_DIM))
-    visual = np.concatenate((visual, visual_zero, visual_zero))
+def prepare_xlnet_text_input(tokens_a, tokens_b, tokenizer, max_seq_length):
+    CLS = tokenizer.cls_token
+    SEP = tokenizer.sep_token
+    PAD_ID = tokenizer.pad_token_id
 
-    segment_ids = [0] * (len(tokens) - 1) + [2]
-
-    input_ids = tokenizer.convert_tokens_to_ids(tokens)
-
+    input_tokens = tokens_a + [SEP] + tokens_b + [SEP] + [CLS]
+    input_ids = tokenizer.convert_tokens_to_ids(input_tokens)
     input_mask = [1] * len(input_ids)
-    padding = [0] * (args.max_seq_length - len(input_ids))
+    segment_ids = [0] * (len(tokens_a) + 1) + [1] * (len(tokens_b) + 1) + [2]
 
-    # then zero pad the visual and acoustic
-    audio_padding = np.zeros((args.max_seq_length - len(input_ids), ACOUSTIC_DIM))
-    acoustic = np.concatenate((audio_padding, acoustic))
+    padding_len = (max_seq_length - len(input_ids))
 
-    video_padding = np.zeros((args.max_seq_length - len(input_ids), VISUAL_DIM))
-    visual = np.concatenate((video_padding, visual))
+    input_ids = [PAD_ID] * padding_len + input_ids
+    input_mask = [0] * padding_len + input_mask
+    segment_ids = [3] * padding_len + segment_ids
 
-    input_ids = padding + input_ids
-    input_mask = padding + input_mask
-    segment_ids = [4] * (args.max_seq_length - len(segment_ids)) + segment_ids
+    return input_ids, input_mask, segment_ids
 
-    return input_ids, visual, acoustic, input_mask, segment_ids
+
+def is_special_token_id(input_id, tokenizer):
+    CLS_ID = tokenizer.cls_token_id
+    PAD_ID = tokenizer.pad_token_id
+    SEP_ID = tokenizer.sep_token_id
+
+    return (input_id == CLS_ID or input_id == PAD_ID or input_id == SEP_ID)
+
+
+def pad_multimodal_input(input, input_ids, tokenizer, max_seq_length):
+    INPUT_DIM = input.shape[1]
+
+    padded_input = np.zeros((max_seq_length, INPUT_DIM))
+    input_index = 0
+
+    # populate padded_input
+    for index, id in enumerate(input_ids):
+        # inject multimodal input if special token isn't present
+        if not(is_special_token_id(id, tokenizer)):
+            padded_input[index] = input[input_index]
+            input_index += 1
+
+    # ensure all inputs are consumed
+    assert input_index == len(input)
+
+    return padded_input
 
 
 def get_tokenizer(model):
@@ -228,12 +273,8 @@ def get_tokenizer(model):
         return BertTokenizer.from_pretrained(model)
     elif model == "xlnet-base-cased":
         return XLNetTokenizer.from_pretrained(model)
-    else:
-        raise ValueError(
-            "Expected 'bert-base-uncased' or 'xlnet-base-cased, but received {}".format(
-                model
-            )
-        )
+    elif model == "albert-base-v2":
+        return AlbertTokenizer.from_pretrained(model)
 
 
 def get_appropriate_dataset(data):
@@ -241,12 +282,17 @@ def get_appropriate_dataset(data):
     tokenizer = get_tokenizer(args.model)
 
     features = convert_to_features(data, args.max_seq_length, tokenizer)
-    all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
-    all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
-    all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
+    all_input_ids = torch.tensor(
+        [f.input_ids for f in features], dtype=torch.long)
+    all_input_mask = torch.tensor(
+        [f.input_mask for f in features], dtype=torch.long)
+    all_segment_ids = torch.tensor(
+        [f.segment_ids for f in features], dtype=torch.long)
     all_visual = torch.tensor([f.visual for f in features], dtype=torch.float)
-    all_acoustic = torch.tensor([f.acoustic for f in features], dtype=torch.float)
-    all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.float)
+    all_acoustic = torch.tensor(
+        [f.acoustic for f in features], dtype=torch.float)
+    all_label_ids = torch.tensor(
+        [f.label_id for f in features], dtype=torch.float)
 
     dataset = TensorDataset(
         all_input_ids,
@@ -260,11 +306,9 @@ def get_appropriate_dataset(data):
 
 
 def set_up_data_loader():
-    with open(
-        os.path.join("datasets", args.dataset, "all_mod_data.pickle"), "rb"
-    ) as handle:
+    data_file = "all_mod_data_concept_vad_hem.pickle"
+    with open(os.path.join(DATASET_LOCATION, args.dataset, data_file), "rb",) as handle:
         all_data = pickle.load(handle)
-
     train_data = all_data["train"]
     dev_data = all_data["dev"]
     test_data = all_data["test"]
@@ -275,7 +319,8 @@ def set_up_data_loader():
 
     num_train_optimization_steps = (
         int(
-            len(train_dataset) / args.train_batch_size / args.gradient_accumulation_step
+            len(train_dataset) / args.train_batch_size /
+            args.gradient_accumulation_step
         )
         * args.n_epochs
     )
@@ -333,7 +378,11 @@ def prep_for_training(num_train_optimization_steps: int):
         )
     elif args.model == "xlnet-base-cased":
         model = MAG_XLNetForSequenceClassification.from_pretrained(
-            args.model, multimodal_config=multimodal_config, num_labels=1
+            args.model, multimodal_config=multimodal_config, num_labels=1,
+        )
+    elif args.model == 'albert-base-v2':
+        model = MAG_AlbertForSequenceClassification.from_pretrained(
+            args.model, multimodal_config=multimodal_config, num_labels=1,
         )
 
     model.to(DEVICE)
@@ -383,7 +432,7 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
             labels=None,
         )
         logits = outputs[0]
-        loss_fct = MSELoss()
+        loss_fct = BCEWithLogitsLoss()
         loss = loss_fct(logits.view(-1), label_ids.view(-1))
 
         if args.gradient_accumulation_step > 1:
@@ -456,7 +505,7 @@ def test_epoch(model: nn.Module, test_dataloader: DataLoader):
                 labels=None,
             )
 
-            logits = outputs[0]
+            logits = torch.sigmoid(outputs[0])
 
             logits = logits.detach().cpu().numpy()
             label_ids = label_ids.detach().cpu().numpy()
@@ -476,21 +525,14 @@ def test_epoch(model: nn.Module, test_dataloader: DataLoader):
 def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=False):
 
     preds, y_test = test_epoch(model, test_dataloader)
-    non_zeros = np.array([i for i, e in enumerate(y_test) if e != 0 or use_zero])
-
-    preds = preds[non_zeros]
-    y_test = y_test[non_zeros]
-
-    mae = np.mean(np.absolute(preds - y_test))
-    corr = np.corrcoef(preds, y_test)[0][1]
-
-    preds = preds >= 0
-    y_test = y_test >= 0
+    preds = preds.round()
 
     f_score = f1_score(y_test, preds, average="weighted")
+    recall = recall_score(y_test, preds)
+    precision = precision_score(y_test, preds)
     acc = accuracy_score(y_test, preds)
 
-    return acc, mae, corr, f_score
+    return acc, recall, precision, f_score
 
 
 def train(
@@ -507,7 +549,7 @@ def train(
     for epoch_i in range(int(args.n_epochs)):
         train_loss = train_epoch(model, train_dataloader, optimizer, scheduler)
         valid_loss = eval_epoch(model, validation_dataloader, optimizer)
-        test_acc, test_mae, test_corr, test_f_score = test_score_model(
+        test_acc, test_recall, test_precision, test_f_score = test_score_model(
             model, test_data_loader
         )
 
@@ -526,18 +568,21 @@ def train(
                     "train_loss": train_loss,
                     "valid_loss": valid_loss,
                     "test_acc": test_acc,
-                    "test_mae": test_mae,
-                    "test_corr": test_corr,
                     "test_f_score": test_f_score,
+                    "test_recall": test_recall,
+                    "test_precision": test_precision,
                     "best_valid_loss": min(valid_losses),
                     "best_test_acc": max(test_accuracies),
                 }
             )
         )
 
+    wandb.run.summary["best_valid_test_acc"] = test_accuracies[np.argmin(
+        valid_losses)]
+
 
 def main():
-    wandb.init(project="MAG")
+    wandb.init(project="MAG_HUMOR")
     wandb.config.update(args)
     set_random_seed(args.seed)
 
@@ -548,7 +593,8 @@ def main():
         num_train_optimization_steps,
     ) = set_up_data_loader()
 
-    model, optimizer, scheduler = prep_for_training(num_train_optimization_steps)
+    model, optimizer, scheduler = prep_for_training(
+        num_train_optimization_steps)
 
     train(
         model,
