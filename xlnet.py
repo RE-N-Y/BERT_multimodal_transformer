@@ -420,7 +420,7 @@ class MAG_XLNetForSequenceClassification(XLNetPreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
 
-        self.multimodal_transformer = MAG_XLNetModel(config, multimodal_config)
+        self.transformer = MAG_XLNetModel(config, multimodal_config)
         self.sequence_summary = SequenceSummary(config)
         self.logits_proj = nn.Linear(config.d_model, config.num_labels)
 
@@ -473,7 +473,7 @@ class MAG_XLNetForSequenceClassification(XLNetPreTrainedModel):
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
         """
-        transformer_outputs = self.multimodal_transformer(
+        transformer_outputs = self.transformer(
             input_ids,
             visual,
             acoustic,

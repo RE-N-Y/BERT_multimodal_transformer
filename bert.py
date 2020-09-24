@@ -242,7 +242,7 @@ class MAG_BertForSequenceClassification(BertPreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
 
-        self.multimodal_bert = MAG_BertModel(config, multimodal_config)
+        self.bert = MAG_BertModel(config, multimodal_config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
 
@@ -288,7 +288,7 @@ class MAG_BertForSequenceClassification(BertPreTrainedModel):
             heads.
         """
 
-        outputs = self.multimodal_bert(
+        outputs = self.bert(
             input_ids,
             visual,
             acoustic,

@@ -187,7 +187,7 @@ class MAG_AlbertForSequenceClassification(AlbertPreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
 
-        self.multimodal_albert = MAG_AlbertModel(config, multimodal_config)
+        self.albert = MAG_AlbertModel(config, multimodal_config)
         self.dropout = nn.Dropout(config.classifier_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, self.config.num_labels)
 
@@ -233,7 +233,7 @@ class MAG_AlbertForSequenceClassification(AlbertPreTrainedModel):
             heads.
         """
 
-        outputs = self.multimodal_albert(
+        outputs = self.albert(
             input_ids=input_ids,
             visual=visual,
             acoustic=acoustic,
